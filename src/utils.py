@@ -5,12 +5,16 @@ import re
 import shutil
 import urllib.parse
 import tempfile
-import sys
+import asyncio
+import psutil
 
 from selenium.webdriver.chrome.webdriver import WebDriver
 import undetected_chromedriver as uc
+import nodriver as nd
 
 FLARESOLVERR_VERSION = None
+DRIVER_SELECTION = None
+PLATFORM_VERSION = None
 CHROME_EXE_PATH = None
 CHROME_MAJOR_VERSION = None
 USER_AGENT = None
@@ -37,6 +41,20 @@ def get_flaresolverr_version() -> str:
     with open(package_path) as f:
         FLARESOLVERR_VERSION = json.loads(f.read())['version']
         return FLARESOLVERR_VERSION
+
+def get_driver_selection() -> str:
+    global DRIVER_SELECTION
+    if DRIVER_SELECTION is not None:
+        return DRIVER_SELECTION
+    DRIVER_SELECTION = os.environ.get('DRIVER', 'undetected-chromedriver')
+    return DRIVER_SELECTION
+
+def get_current_platform() -> str:
+    global PLATFORM_VERSION
+    if PLATFORM_VERSION is not None:
+        return PLATFORM_VERSION
+    PLATFORM_VERSION = os.name
+    return PLATFORM_VERSION
 
 
 def create_proxy_extension(proxy: dict) -> str:
@@ -113,9 +131,74 @@ def create_proxy_extension(proxy: dict) -> str:
     return proxy_extension_dir
 
 
-def get_webdriver(proxy: dict = None) -> WebDriver:
+async def get_webdriver_nd(proxy: dict = None) -> nd.Browser:
+    logging.debug('Launching web browser with nodriver...')
+
+    options = nd.Config()
+    options.sandbox = False
+    options.add_argument('--window-size=1920,1080')
+    # todo: this param shows a warning in chrome head-full
+    options.add_argument('--disable-setuid-sandbox')
+    # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
+    options.add_argument('--no-zygote')
+    # attempt to fix Docker ARM32 build
+    options.add_argument('--disable-gpu-sandbox')
+    options.add_argument('--disable-software-rasterizer')
+    options.add_argument('--ignore-certificate-errors')
+    options.add_argument('--ignore-ssl-errors')
+    # fix GL errors in ASUSTOR NAS
+    # https://github.com/FlareSolverr/FlareSolverr/issues/782
+    # https://github.com/microsoft/vscode/issues/127800#issuecomment-873342069
+    # https://peter.sh/experiments/chromium-command-line-switches/#use-gl
+    options.add_argument('--use-gl=swiftshader')
+
+    language = os.environ.get('LANG', None)
+    if language is not None:
+        options.lang = language
+
+    # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
+    if USER_AGENT is not None:
+        options.add_argument('--user-agent=%s' % USER_AGENT)
+
+    proxy_extension_dir = None
+    if proxy and all(key in proxy for key in ['url', 'username', 'password']):
+        proxy_extension_dir = create_proxy_extension(proxy)
+        options.add_extension(os.path.abspath(proxy_extension_dir))
+    elif proxy and 'url' in proxy:
+        proxy_url = proxy['url']
+        logging.debug("Using proxy: %s", proxy_url)
+        options.add_argument('--proxy-server=%s' % proxy_url)
+
+    # note: headless mode is detected (headless = True)
+    # we launch the browser in head-full mode with the window hidden
+    if get_config_headless():
+        if PLATFORM_VERSION == 'nt':
+            options.windows_headless = True
+        else:
+            start_xvfb_display()
+    # For normal headless mode:
+    # options.headless = True or False
+
+    # Add browser binary path for Windows
+    if PLATFORM_VERSION == "nt":
+        options.browser_executable_path = CHROME_EXE_PATH
+
+    try:
+        driver = await nd.Browser.create(config=options)
+    except Exception as e:
+        logging.error("Error creating Chrome Browser: %s" % e)
+
+    # clean up proxy extension directory
+    if proxy_extension_dir is not None:
+        shutil.rmtree(proxy_extension_dir)
+
+    return driver
+
+
+def get_webdriver_uc(proxy: dict = None) -> WebDriver:
     global PATCHED_DRIVER_PATH, USER_AGENT
-    logging.debug('Launching web browser...')
+
+    logging.debug('Launching web browser with undetected-chromedriver...')
 
     # undetected_chromedriver
     options = uc.ChromeOptions()
@@ -158,7 +241,7 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     # we launch the browser in head-full mode with the window hidden
     windows_headless = False
     if get_config_headless():
-        if os.name == 'nt':
+        if PLATFORM_VERSION == 'nt':
             windows_headless = True
         else:
             start_xvfb_display()
@@ -166,6 +249,7 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     # options.add_argument('--headless')
 
     options.add_argument("--auto-open-devtools-for-tabs")
+    options.add_argument("--disable-popup-blocking")
 
     # if we are inside the Docker container, we avoid downloading the driver
     driver_exe_path = None
@@ -238,7 +322,7 @@ def get_chrome_major_version() -> str:
     if CHROME_MAJOR_VERSION is not None:
         return CHROME_MAJOR_VERSION
 
-    if os.name == 'nt':
+    if PLATFORM_VERSION == 'nt':
         # Example: '104.0.5112.79'
         try:
             complete_version = extract_version_nt_executable(get_chrome_exe_path())
@@ -298,14 +382,34 @@ def extract_version_nt_folder() -> str:
     return ''
 
 
-def get_user_agent(driver=None) -> str:
+async def get_user_agent_nd(driver=None) -> str:
     global USER_AGENT
     if USER_AGENT is not None:
         return USER_AGENT
 
     try:
         if driver is None:
-            driver = get_webdriver()
+            logging.info("Launching web browser...")
+            driver = await get_webdriver_nd()
+        USER_AGENT = driver.info['User-Agent']
+        # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
+        USER_AGENT = re.sub('HEADLESS', '', USER_AGENT, flags=re.IGNORECASE)
+        return USER_AGENT
+    except Exception as e:
+        raise Exception("Error getting browser User-Agent. " + str(e))
+    finally:
+        if driver is not None:
+            await after_run_cleanup(driver=driver)
+
+
+def get_user_agent_uc(driver=None) -> str:
+    global USER_AGENT
+    if USER_AGENT is not None:
+        return USER_AGENT
+
+    try:
+        if driver is None:
+            driver = get_webdriver_uc()
         USER_AGENT = driver.execute_script("return navigator.userAgent")
         # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
         USER_AGENT = re.sub('HEADLESS', '', USER_AGENT, flags=re.IGNORECASE)
@@ -314,9 +418,73 @@ def get_user_agent(driver=None) -> str:
         raise Exception("Error getting browser User-Agent. " + str(e))
     finally:
         if driver is not None:
-            driver.close()
+            if PLATFORM_VERSION == "nt":
+                driver.close()
             driver.quit()
 
+
+async def after_run_cleanup(driver: nd.Browser):
+    """
+    After run function to remove Chromium processes and delete the
+    the Browser instance data dir if necessary.
+    """
+
+    # Get Browser instance process
+    process = driver.get_process
+    if process is None:
+        return
+
+    # Get the list of child processes before closing the Browser instance
+    child_processes = psutil.Process(process.pid).children(recursive=True)
+
+    # Stop Browser instance
+    driver.stop()
+
+    # Wait for the websocket to return True (Closed)
+    while True:
+        websocket_status = driver.connection.closed
+        logging.debug(f"Websocket status: {websocket_status}")
+        if websocket_status:
+            break
+        await asyncio.sleep(0.1)
+
+    # Find all chromium processes and terminate them if any
+    for proc in child_processes:
+        try:
+            if proc.pid == process.pid:
+                logging.debug(f"Terminating Chromium process with PID: {proc.pid}")
+                proc.terminate()
+            elif any(name in proc.name().lower() for name in ("chromium", "chrome")):
+                logging.debug(f"Terminating Chromium child process with PID: {proc.pid}")
+                proc.terminate()
+            elif proc.status() == 'zombie':
+                logging.debug(f"Terminating zombie Chromium process with PID: {proc.pid}")
+                proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+    # Wait for all processes to terminate
+    for proc in child_processes:
+        try:
+            if proc.pid == process.pid or \
+            any(name in proc.name().lower() for name in ("chromium", "chrome")):
+                proc.wait(timeout=10)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+
+    # Delete Browser instance data dir
+    try:
+        user_dir = driver.config.user_data_dir
+        shutil.rmtree(user_dir, ignore_errors=False)
+        logging.debug(f"Removed Browser user data directory {user_dir}")
+    except OSError as e:
+        logging.debug(f"Failed to delete Browser user data directory {user_dir} - {str(e)}")
+
+    # Remove Browser instance from created instances
+    try:
+        nd.util.get_registered_instances().remove(driver)
+    except Exception as e:
+        logging.debug(f"Error when removing the Browser instance: {str(e)}")
 
 def start_xvfb_display():
     global XVFB_DISPLAY

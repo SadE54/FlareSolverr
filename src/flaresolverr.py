@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sys
+import asyncio
 
 import certifi
 from bottle import run, response, Bottle, request, ServerAdapter
@@ -11,6 +12,7 @@ from bottle_plugins.logger_plugin import logger_plugin
 from bottle_plugins import prometheus_plugin
 from dtos import V1RequestBase
 import flaresolverr_service
+import flaresolverr_service_nd
 import utils
 
 
@@ -51,7 +53,10 @@ def controller_v1():
     Controller v1
     """
     req = V1RequestBase(request.json)
-    res = flaresolverr_service.controller_v1_endpoint(req)
+    if utils.DRIVER_SELECTION == "nodriver":
+        res = asyncio.run(flaresolverr_service_nd.controller_v1_endpoint_nd(req))
+    else:
+        res = flaresolverr_service.controller_v1_endpoint(req)
     if res.__error_500__:
         response.status = 500
     return utils.object_to_dict(res)
@@ -81,6 +86,9 @@ if __name__ == "__main__":
     server_host = os.environ.get('HOST', '0.0.0.0')
     server_port = int(os.environ.get('PORT', 8191))
 
+    # check if undetected-chromedriver or nodriver is selected
+    utils.get_driver_selection()
+
     # configure logger
     logger_format = '%(asctime)s %(levelname)-8s %(message)s'
     if log_level == 'DEBUG':
@@ -97,12 +105,23 @@ if __name__ == "__main__":
     logging.getLogger('urllib3').setLevel(logging.ERROR)
     logging.getLogger('selenium.webdriver.remote.remote_connection').setLevel(logging.WARNING)
     logging.getLogger('undetected_chromedriver').setLevel(logging.WARNING)
+    # nodriver is very verbose in debug
+    logging.getLogger('nd.core.element').disabled = True
+    logging.getLogger('nodriver.core.browser').disabled = True
+    logging.getLogger('nodriver.core.tab').disabled = True
+    logging.getLogger('websockets.client').disabled = True
 
     logging.info(f'FlareSolverr {utils.get_flaresolverr_version()}')
     logging.debug('Debug log enabled')
 
-    # test browser installation
-    flaresolverr_service.test_browser_installation()
+    # Get current OS for global variable
+    utils.get_current_platform()
+
+    # test browser installation for undetected-chromedriver or start loop for nodriver
+    if utils.DRIVER_SELECTION == "nodriver":
+        asyncio.run(flaresolverr_service_nd.test_browser_installation_nd())
+    else:
+        flaresolverr_service.test_browser_installation_uc()
 
     # start bootle plugins
     # plugin order is important

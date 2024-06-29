@@ -1,7 +1,7 @@
 name: release-docker
 
 on:
-  release:
+  push:
     tags:
       - 'v*.*.*'
   pull_request:
